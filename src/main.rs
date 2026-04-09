@@ -1,27 +1,29 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::SystemTime;
 
-use anyhow::{Context as AnyhowContext, Result, anyhow};
+use anyhow::{anyhow, Context as AnyhowContext, Result};
 use chrono::{DateTime, Local, Utc};
 use gpui::prelude::FluentBuilder as _;
-use gpui::{
-    AnyElement, App, AppContext as _, Application, Bounds, BoxShadow, Context, Hsla,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, SharedString,
-    Styled as _, Window, WindowBounds, WindowOptions, div, point, px, rgb, size,
-};
 #[cfg(target_os = "linux")]
 use gpui::StatefulInteractiveElement as _;
+use gpui::{
+    div, point, px, rgb, size, AnyElement, App, AppContext as _, Application, Bounds, BoxShadow,
+    Context, HighlightStyle, Hsla, InteractiveElement as _, IntoElement, MouseButton,
+    ParentElement as _, Render, SharedString, Styled as _, StyledText, Window, WindowBounds,
+    WindowOptions,
+};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::list::ListItem;
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, PixelsExt as _, Root, StyledExt as _, h_flex, theme,
-    v_flex,
+    h_flex, theme, v_flex, ActiveTheme as _, Disableable as _, PixelsExt as _, Root, StyledExt as _,
 };
 use serde_json::Value;
 use walkdir::WalkDir;
@@ -104,10 +106,8 @@ fn surface_shadow() -> Vec<BoxShadow> {
 
 #[cfg(target_os = "linux")]
 fn render_linux_window_controls(window: &Window) -> AnyElement {
-    let button = |id: &'static str,
-                  label: &'static str,
-                  on_click: fn(&mut Window),
-                  is_close: bool| {
+    let button =
+        |id: &'static str, label: &'static str, on_click: fn(&mut Window), is_close: bool| {
             div()
                 .id(id)
                 .flex()
@@ -177,15 +177,128 @@ fn render_linux_window_controls(_window: &Window) -> AnyElement {
     div().into_any_element()
 }
 
-fn soft_wrap_text(input: impl AsRef<str>) -> String {
+fn push_soft_wrapped_char(output: &mut String, ch: char) {
+    output.push(ch);
+    if matches!(ch, '/' | '\\' | '_' | '-' | '>' | '<') {
+        output.push('\u{200b}');
+    }
+}
+
+fn case_insensitive_match_ranges(haystack: &str, needle: &str) -> Vec<Range<usize>> {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+
+    let needle_lower = needle.to_lowercase();
+    let mut matches = Vec::new();
+
+    for (start, _) in haystack.char_indices() {
+        let mut candidate = String::new();
+
+        for (offset, ch) in haystack[start..].char_indices() {
+            candidate.extend(ch.to_lowercase());
+            let end = start + offset + ch.len_utf8();
+
+            if candidate == needle_lower {
+                matches.push(start..end);
+                break;
+            }
+
+            if !needle_lower.starts_with(&candidate) {
+                break;
+            }
+        }
+    }
+
+    matches
+}
+
+fn first_case_insensitive_match_range(haystack: &str, needle: &str) -> Option<Range<usize>> {
+    case_insensitive_match_ranges(haystack, needle)
+        .into_iter()
+        .next()
+}
+
+fn soft_wrap_text_with_highlights(
+    input: &str,
+    ranges: &[Range<usize>],
+) -> (String, Vec<Range<usize>>) {
+    let mut wrapped = String::new();
+    let mut boundary_map = HashMap::new();
+
+    boundary_map.insert(0usize, 0usize);
+    for (idx, ch) in input.char_indices() {
+        boundary_map.insert(idx, wrapped.len());
+        push_soft_wrapped_char(&mut wrapped, ch);
+    }
+    boundary_map.insert(input.len(), wrapped.len());
+
+    let mapped_ranges = ranges
+        .iter()
+        .filter_map(|range| {
+            Some(
+                boundary_map.get(&range.start)?.to_owned()
+                    ..boundary_map.get(&range.end)?.to_owned(),
+            )
+        })
+        .collect();
+
+    (wrapped, mapped_ranges)
+}
+
+fn search_highlight_style() -> HighlightStyle {
+    HighlightStyle {
+        background_color: Some(theme::yellow_100().opacity(0.95)),
+        ..Default::default()
+    }
+}
+
+fn highlighted_search_text(text: &str, filter: &str) -> StyledText {
+    let ranges = case_insensitive_match_ranges(text, filter);
+    let (wrapped, wrapped_ranges) = soft_wrap_text_with_highlights(text, &ranges);
+    let styled = StyledText::new(wrapped);
+
+    if wrapped_ranges.is_empty() {
+        styled
+    } else {
+        styled.with_highlights(
+            wrapped_ranges
+                .into_iter()
+                .map(|range| (range, search_highlight_style()))
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+fn byte_index_for_char_offset(input: &str, char_offset: usize) -> usize {
     input
-        .as_ref()
-        .replace('/', "/\u{200b}")
-        .replace('\\', "\\\u{200b}")
-        .replace('_', "_\u{200b}")
-        .replace('-', "-\u{200b}")
-        .replace('>', ">\u{200b}")
-        .replace('<', "<\u{200b}")
+        .char_indices()
+        .nth(char_offset)
+        .map(|(idx, _)| idx)
+        .unwrap_or(input.len())
+}
+
+fn excerpt_around_match(input: &str, range: Range<usize>, context_chars: usize) -> String {
+    let match_start_chars = input[..range.start].chars().count();
+    let match_end_chars = input[..range.end].chars().count();
+    let total_chars = input.chars().count();
+
+    let excerpt_start_chars = match_start_chars.saturating_sub(context_chars);
+    let excerpt_end_chars = (match_end_chars + context_chars).min(total_chars);
+    let excerpt_start = byte_index_for_char_offset(input, excerpt_start_chars);
+    let excerpt_end = byte_index_for_char_offset(input, excerpt_end_chars);
+
+    let mut excerpt = String::new();
+    if excerpt_start > 0 {
+        excerpt.push('…');
+    }
+    excerpt.push_str(&input[excerpt_start..excerpt_end]);
+    if excerpt_end < input.len() {
+        excerpt.push('…');
+    }
+
+    excerpt
 }
 
 #[derive(Clone, Debug)]
@@ -205,27 +318,26 @@ impl SessionEntry {
         if filter.trim().is_empty() {
             return true;
         }
-        let needle = filter.to_lowercase();
-        self.id.to_lowercase().contains(&needle)
+        !case_insensitive_match_ranges(&self.id, filter).is_empty()
             || self
                 .title
                 .as_deref()
-                .map(|title| title.to_lowercase().contains(&needle))
+                .map(|title| !case_insensitive_match_ranges(title, filter).is_empty())
                 .unwrap_or(false)
             || self
                 .cwd
                 .as_deref()
-                .map(|cwd| cwd.to_lowercase().contains(&needle))
+                .map(|cwd| !case_insensitive_match_ranges(cwd, filter).is_empty())
                 .unwrap_or(false)
             || self
                 .originator
                 .as_deref()
-                .map(|origin| origin.to_lowercase().contains(&needle))
+                .map(|origin| !case_insensitive_match_ranges(origin, filter).is_empty())
                 .unwrap_or(false)
             || self
                 .preview_items
                 .iter()
-                .any(|item| item.text.to_lowercase().contains(&needle))
+                .any(|item| !case_insensitive_match_ranges(&item.text, filter).is_empty())
     }
 
     fn display_title(&self) -> String {
@@ -241,6 +353,39 @@ impl SessionEntry {
             .unwrap_or_else(|| self.id.clone())
     }
 
+    fn has_visible_row_match(&self, filter: &str) -> bool {
+        let title = self.display_title();
+        !case_insensitive_match_ranges(&title, filter).is_empty()
+            || self
+                .cwd
+                .as_deref()
+                .map(|cwd| !case_insensitive_match_ranges(cwd, filter).is_empty())
+                .unwrap_or(false)
+            || self
+                .originator
+                .as_deref()
+                .map(|origin| !case_insensitive_match_ranges(origin, filter).is_empty())
+                .unwrap_or(false)
+    }
+
+    fn hidden_match_context(&self, filter: &str) -> Option<String> {
+        if filter.trim().is_empty() || self.has_visible_row_match(filter) {
+            return None;
+        }
+
+        if !case_insensitive_match_ranges(&self.id, filter).is_empty() {
+            return Some(format!("Session ID: {}", self.id));
+        }
+
+        self.preview_items.iter().find_map(|item| {
+            let matched_range = first_case_insensitive_match_range(&item.text, filter)?;
+            Some(format!(
+                "{}: {}",
+                item.role.label(),
+                excerpt_around_match(&item.text, matched_range, 34)
+            ))
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -320,8 +465,9 @@ impl SessionManagerApp {
                 .clean_on_escape()
                 .default_value("")
         });
-        let filter_subscription =
-            cx.subscribe(&filter_input, |this, input: gpui::Entity<InputState>, event, cx| {
+        let filter_subscription = cx.subscribe(
+            &filter_input,
+            |this, input: gpui::Entity<InputState>, event, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.filter = input.read(cx).value();
                     if !this.filter.trim().is_empty() {
@@ -329,11 +475,15 @@ impl SessionManagerApp {
                     }
                     cx.notify();
                 }
-            });
+            },
+        );
 
         let (sessions, load_error) = match load_sessions() {
             Ok(list) => (list, None),
-            Err(err) => (Vec::new(), Some(format!("Failed to load sessions: {err:#}"))),
+            Err(err) => (
+                Vec::new(),
+                Some(format!("Failed to load sessions: {err:#}")),
+            ),
         };
 
         Self {
@@ -353,7 +503,9 @@ impl SessionManagerApp {
         self.sessions
             .iter()
             .enumerate()
-            .filter_map(|(idx, session)| session.matches_filter(self.filter.as_ref()).then_some(idx))
+            .filter_map(|(idx, session)| {
+                session.matches_filter(self.filter.as_ref()).then_some(idx)
+            })
             .collect()
     }
 
@@ -454,9 +606,14 @@ impl SessionManagerApp {
         })
     }
 
-    fn render_metadata_pair(&self, label: &str, value: impl Into<String>) -> gpui::AnyElement {
+    fn render_metadata_pair(
+        &self,
+        label: &str,
+        value: impl Into<String>,
+        filter: &str,
+    ) -> gpui::AnyElement {
         let label = label.to_string();
-        let value = soft_wrap_text(value.into());
+        let value = value.into();
         v_flex()
             .w_full()
             .overflow_hidden()
@@ -477,7 +634,7 @@ impl SessionManagerApp {
                     .text_sm()
                     .whitespace_normal()
                     .text_color(theme::neutral_800())
-                    .child(value),
+                    .child(highlighted_search_text(&value, filter)),
             )
             .into_any_element()
     }
@@ -485,7 +642,7 @@ impl SessionManagerApp {
     fn render_card(
         &self,
         eyebrow: &str,
-        title: impl Into<String>,
+        title: impl IntoElement,
         content: impl IntoElement,
     ) -> gpui::AnyElement {
         let eyebrow = eyebrow.to_string();
@@ -521,7 +678,7 @@ impl SessionManagerApp {
                             .font_semibold()
                             .text_color(theme::neutral_950())
                             .whitespace_normal()
-                            .child(title.into()),
+                            .child(title),
                     ),
             )
             .child(div().w_full().overflow_hidden().child(content))
@@ -534,6 +691,8 @@ impl SessionManagerApp {
         entity: gpui::Entity<Self>,
     ) -> gpui::AnyElement {
         let session = &self.sessions[session_idx];
+        let title = session.display_title();
+        let filter = self.filter.as_ref();
         let timestamp = session
             .created_at
             .with_timezone(&Local)
@@ -574,7 +733,7 @@ impl SessionManagerApp {
                             .whitespace_normal()
                             .line_clamp(2)
                             .text_color(theme::neutral_950())
-                            .child(soft_wrap_text(session.display_title())),
+                            .child(highlighted_search_text(&title, filter)),
                     )
                     .when_some(session.cwd.as_ref(), |this, cwd| {
                         this.child(
@@ -583,7 +742,17 @@ impl SessionManagerApp {
                                 .whitespace_normal()
                                 .line_clamp(1)
                                 .text_color(theme::neutral_500())
-                                .child(soft_wrap_text(cwd)),
+                                .child(highlighted_search_text(cwd, filter)),
+                        )
+                    })
+                    .when_some(session.hidden_match_context(filter), |this, context| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .whitespace_normal()
+                                .line_clamp(2)
+                                .text_color(theme::sky_700())
+                                .child(highlighted_search_text(&context, filter)),
                         )
                     })
                     .child(
@@ -607,7 +776,7 @@ impl SessionManagerApp {
                                         .py_1()
                                         .text_xs()
                                         .text_color(theme::neutral_600())
-                                        .child(originator.clone()),
+                                        .child(highlighted_search_text(originator, filter)),
                                 )
                             }),
                     ),
@@ -628,6 +797,7 @@ impl SessionManagerApp {
 
     fn render_session_preview(&self, idx: usize) -> gpui::AnyElement {
         let session = &self.sessions[idx];
+        let filter = self.filter.as_ref();
         let formatted_time = session
             .created_at
             .with_timezone(&Local)
@@ -635,7 +805,7 @@ impl SessionManagerApp {
             .to_string();
         let overview_card = self.render_card(
             "Session Overview",
-            soft_wrap_text(session.display_title()),
+            highlighted_search_text(&session.display_title(), filter),
             v_flex()
                 .w_full()
                 .gap_4()
@@ -651,17 +821,22 @@ impl SessionManagerApp {
                     v_flex()
                         .w_full()
                         .gap_3()
-                        .child(self.render_metadata_pair("Session ID", session.id.clone()))
-                        .child(self.render_metadata_pair("Created", formatted_time))
+                        .child(self.render_metadata_pair("Session ID", session.id.clone(), filter))
+                        .child(self.render_metadata_pair("Created", formatted_time, filter))
                         .when_some(session.originator.as_ref(), |this, originator| {
-                            this.child(self.render_metadata_pair("Origin", originator.clone()))
+                            this.child(self.render_metadata_pair("Origin", originator.clone(), filter))
                         })
                         .when_some(session.cwd.as_ref(), |this, cwd| {
-                            this.child(self.render_metadata_pair("Working Directory", cwd.clone()))
+                            this.child(self.render_metadata_pair(
+                                "Working Directory",
+                                cwd.clone(),
+                                filter,
+                            ))
                         })
                         .child(self.render_metadata_pair(
                             "Session File",
                             session.file_path.display().to_string(),
+                            filter,
                         )),
                 )
                 .when_some(session.instructions.as_ref(), |this, instructions| {
@@ -692,7 +867,7 @@ impl SessionManagerApp {
                                         .text_sm()
                                         .whitespace_normal()
                                         .text_color(theme::neutral_700())
-                                        .child(soft_wrap_text(instructions)),
+                                        .child(highlighted_search_text(instructions, filter)),
                                 ),
                         )
                     }
@@ -741,7 +916,7 @@ impl SessionManagerApp {
                                                 .text_sm()
                                                 .whitespace_normal()
                                                 .text_color(theme::neutral_800())
-                                                .child(soft_wrap_text(&message.text)),
+                                                .child(highlighted_search_text(&message.text, filter)),
                                         ),
                                 )
                             })),
@@ -1112,7 +1287,13 @@ fn load_sessions() -> Result<Vec<SessionEntry>> {
         .into_iter()
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_file())
-        .filter(|entry| entry.path().extension().map(|ext| ext == "jsonl").unwrap_or(false))
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .map(|ext| ext == "jsonl")
+                .unwrap_or(false)
+        })
         .filter_map(|entry| match parse_session_file(entry.path()) {
             Ok(Some(session)) => Some(session),
             Ok(None) => None,
@@ -1147,8 +1328,8 @@ fn parse_session_file(path: &Path) -> Result<Option<SessionEntry>> {
         if line.trim().is_empty() {
             continue;
         }
-        let value: Value =
-            serde_json::from_str(&line).with_context(|| format!("parsing JSON in {}", path.display()))?;
+        let value: Value = serde_json::from_str(&line)
+            .with_context(|| format!("parsing JSON in {}", path.display()))?;
         let record_type = value
             .get("type")
             .and_then(Value::as_str)
@@ -1169,7 +1350,10 @@ fn parse_session_file(path: &Path) -> Result<Option<SessionEntry>> {
                         .get("instructions")
                         .and_then(Value::as_str)
                         .map(str::to_string);
-                    cwd = payload.get("cwd").and_then(Value::as_str).map(str::to_string);
+                    cwd = payload
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
                     originator = payload
                         .get("originator")
                         .and_then(Value::as_str)
@@ -1307,16 +1491,13 @@ fn derive_title_candidate(input: &str) -> Option<String> {
         return None;
     }
 
-    let candidate = trimmed
-        .lines()
-        .map(str::trim)
-        .find(|line| {
-            !line.is_empty()
-                && *line != "<image>"
-                && *line != "</image>"
-                && !line.starts_with("```")
-                && !line.starts_with("![")
-        })?;
+    let candidate = trimmed.lines().map(str::trim).find(|line| {
+        !line.is_empty()
+            && *line != "<image>"
+            && *line != "</image>"
+            && !line.starts_with("```")
+            && !line.starts_with("![")
+    })?;
 
     let normalized = normalize_title_line(candidate);
     let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1368,7 +1549,8 @@ fn normalize_title_line(input: &str) -> String {
 }
 
 fn codex_sessions_dir() -> Result<PathBuf> {
-    let home = dirs_next::home_dir().ok_or_else(|| anyhow!("Could not determine home directory"))?;
+    let home =
+        dirs_next::home_dir().ok_or_else(|| anyhow!("Could not determine home directory"))?;
     let sessions_dir = home.join(".codex").join("sessions");
     if !sessions_dir.exists() {
         return Err(anyhow!(
