@@ -1318,12 +1318,53 @@ fn derive_title_candidate(input: &str) -> Option<String> {
                 && !line.starts_with("![")
         })?;
 
-    let collapsed = candidate.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = normalize_title_line(candidate);
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
         None
     } else {
         Some(truncate_with_ellipsis(&collapsed, TITLE_CHAR_LIMIT))
     }
+}
+
+fn normalize_title_line(input: &str) -> String {
+    let mut remaining = input;
+    let mut normalized = String::new();
+
+    while let Some(label_start) = remaining.find('[') {
+        normalized.push_str(&remaining[..label_start]);
+        let after_label_start = &remaining[label_start + 1..];
+
+        let Some(label_end) = after_label_start.find(']') else {
+            normalized.push_str(&remaining[label_start..]);
+            return normalized;
+        };
+
+        let label = &after_label_start[..label_end];
+        let after_label = &after_label_start[label_end + 1..];
+
+        if let Some(link_target) = after_label.strip_prefix('(') {
+            if let Some(link_end) = link_target.find(')') {
+                let target = &link_target[..link_end];
+                if target.starts_with("app://")
+                    || target.starts_with("plugin://")
+                    || target.starts_with('/')
+                {
+                    normalized.push_str(label.trim_start_matches('$'));
+                    remaining = &link_target[link_end + 1..];
+                    continue;
+                }
+            }
+        }
+
+        normalized.push('[');
+        normalized.push_str(label);
+        normalized.push(']');
+        remaining = after_label;
+    }
+
+    normalized.push_str(remaining);
+    normalized
 }
 
 fn codex_sessions_dir() -> Result<PathBuf> {
